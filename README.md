@@ -1,7 +1,7 @@
 # Bulk Auto Buy/Transfer
 ## Script
 ```
-loadstring(game:HttpGet("https://raw.githubusercontent.com/exploit-luau/gag2-auto-buy-bulk-transfer/refs/heads/main/script")()
+loadstring(game:HttpGet("https://raw.githubusercontent.com/exploit-luau/gag2-auto-buy-bulk-transfer/refs/heads/main/script"))()
 ```
 
 ## Description
