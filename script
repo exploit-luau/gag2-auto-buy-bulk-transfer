@@ -1,0 +1,590 @@
+--[[
+Bulk Auto Buy/Transfer – Seeds & Gears (FINAL WORKING)
+- Seeds auto-buy: "j" packets.
+- Gears auto-buy: "n" packets.
+- Transfer: sends seeds (category "Seeds") and gears (correct mail category from name).
+  Uses same reliable SendBatch call that worked before.
+]]
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
+local LocalPlayer = Players.LocalPlayer
+local RemoteEvent = ReplicatedStorage:WaitForChild("SharedModules"):WaitForChild("Packet"):WaitForChild("RemoteEvent")
+local Networking = require(ReplicatedStorage:WaitForChild("SharedModules"):WaitForChild("Networking"))
+local SendBatch = Networking.Mailbox.SendBatch
+
+local CHECK_INTERVAL = 5
+
+-- ================= SHOP DEFINITIONS =================
+local SHOPS = {
+    Seeds = {
+        stockFolder = "StockValues/SeedShop/Items",
+        restockPath = "StockValues/SeedShop/UnixNextRestock",
+        packetPrefix = "j",
+        guiLabel = "Seeds"
+    },
+    Gears = {
+        stockFolder = "StockValues/GearShop/Items",
+        restockPath = "StockValues/GearShop/UnixNextRestock",
+        packetPrefix = "n",
+        guiLabel = "Gears"
+    }
+}
+
+-- ================= HELPERS =================
+local function getStock(shopKey, itemName)
+    local path = SHOPS[shopKey].stockFolder
+    local folder = ReplicatedStorage
+    for segment in path:gmatch("[^/]+") do
+        folder = folder:FindFirstChild(segment)
+        if not folder then return 0 end
+    end
+    local stockValue = folder:FindFirstChild(itemName)
+    if stockValue then return stockValue.Value or 0 end
+    return 0
+end
+
+local function getUnixNextRestock(shopKey)
+    local path = SHOPS[shopKey].restockPath
+    local folder = ReplicatedStorage
+    for segment in path:gmatch("[^/]+") do
+        folder = folder:FindFirstChild(segment)
+        if not folder then return nil end
+    end
+    return folder.Value
+end
+
+local function getAllItemNames(shopKey)
+    local names = {}
+    local path = SHOPS[shopKey].stockFolder
+    local folder = ReplicatedStorage
+    for segment in path:gmatch("[^/]+") do
+        folder = folder:FindFirstChild(segment)
+        if not folder then return names end
+    end
+    for _, stockValue in folder:GetChildren() do
+        if stockValue:IsA("IntValue") or stockValue:IsA("NumberValue") then
+            table.insert(names, stockValue.Name)
+        end
+    end
+    table.sort(names)
+    return names
+end
+
+-- ================= AUTO‑BUY SYSTEM =================
+local AutoBuy = {}
+AutoBuy.shops = {}
+for shopKey, _ in pairs(SHOPS) do
+    AutoBuy.shops[shopKey] = {
+        enabled = false,
+        selectedItems = {},
+        timerLabel = nil,
+        cachedNextRestock = nil
+    }
+end
+
+function AutoBuy:makeBuyBuffer(shopKey, itemName)
+    local prefix = SHOPS[shopKey].packetPrefix
+    return buffer.fromstring(prefix .. "\x00" .. string.char(#itemName) .. itemName)
+end
+
+function AutoBuy:buyItem(shopKey, itemName)
+    RemoteEvent:FireServer(self:makeBuyBuffer(shopKey, itemName))
+end
+
+function AutoBuy:purchaseAllAvailable(shopKey)
+    local shop = self.shops[shopKey]
+    if not shop.enabled then return end
+    if #shop.selectedItems == 0 then return end
+    for _, itemName in ipairs(shop.selectedItems) do
+        local stock = getStock(shopKey, itemName)
+        if stock > 0 then
+            print(string.format("[AutoBuy-%s] Buying %d x %s", shopKey, stock, itemName))
+            for i = 1, stock do
+                self:buyItem(shopKey, itemName)
+                task.wait(0.05)
+            end
+        else
+            print(string.format("[AutoBuy-%s] No stock for %s", shopKey, itemName))
+        end
+    end
+end
+
+function AutoBuy:restockLoop(shopKey)
+    local shop = self.shops[shopKey]
+    while shop.enabled do
+        if not shop.cachedNextRestock then
+            shop.cachedNextRestock = getUnixNextRestock(shopKey)
+            if shop.cachedNextRestock then
+                print(string.format("[AutoBuy-%s] Initial cached restock: %d", shopKey, shop.cachedNextRestock))
+            end
+        end
+        local now = os.time()
+        local nextRestock = shop.cachedNextRestock
+        if nextRestock then
+            local diff = nextRestock - now
+            local sign = diff >= 0 and "+" or "-"
+            print(string.format("[AutoBuy-%s] cached: %d | now: %d | diff: %s%d",
+                shopKey, nextRestock, now, sign, math.abs(diff)))
+        end
+        if shop.timerLabel then
+            if nextRestock then
+                local remaining = math.max(0, nextRestock - now)
+                local mins = math.floor(remaining / 60)
+                local secs = remaining % 60
+                shop.timerLabel.Text = string.format("%s: %dm %ds", shopKey, mins, secs)
+            else
+                shop.timerLabel.Text = shopKey .. ": unknown"
+            end
+        end
+        if nextRestock and now >= nextRestock then
+            print(string.format("[AutoBuy-%s] >>> Restock triggered! Buying...", shopKey))
+            self:purchaseAllAvailable(shopKey)
+            local newRestock = getUnixNextRestock(shopKey)
+            if newRestock then
+                print(string.format("[AutoBuy-%s] New restock cached: %d", shopKey, newRestock))
+                shop.cachedNextRestock = newRestock
+            else
+                print(string.format("[AutoBuy-%s] Warning: Could not fetch new restock.", shopKey))
+                shop.cachedNextRestock = nil
+            end
+        end
+        task.wait(CHECK_INTERVAL)
+    end
+end
+
+function AutoBuy:startShop(shopKey)
+    local shop = self.shops[shopKey]
+    if shop.enabled then return end
+    shop.enabled = true
+    shop.cachedNextRestock = nil
+    print(string.format("[AutoBuy-%s] Started", shopKey))
+    print(string.format("[AutoBuy-%s] Immediate purchase...", shopKey))
+    self:purchaseAllAvailable(shopKey)
+    task.spawn(function() self:restockLoop(shopKey) end)
+end
+
+function AutoBuy:stopShop(shopKey)
+    local shop = self.shops[shopKey]
+    shop.enabled = false
+    print(string.format("[AutoBuy-%s] Stopped", shopKey))
+    if shop.timerLabel then
+        shop.timerLabel.Text = shopKey .. ": --"
+    end
+end
+
+-- ================= TRANSFER (FIXED) =================
+local Transfer = {}
+Transfer.enabled = false
+Transfer.targetUsername = ""
+Transfer.sendInProgress = false
+
+-- Map gear tool names to mail category (taken from MailboxItemCatalog Categories)
+local function getMailCategory(tool)
+    local cat = tool:GetAttribute("MainCategory")
+    if not cat then return nil end
+    cat = string.lower(tostring(cat))
+
+    if cat == "seed" then
+        return "Seeds"
+    elseif cat == "gear" then
+        local name = tool.Name
+        if name:find("Sprinkler") then return "Sprinklers" end
+        if name:find("Watering Can") then return "WateringCans" end
+        if name:find("Mushroom") then return "Mushrooms" end
+        if name:find("Gnome") then return "Gnomes" end
+        if name:find("Raccoon") then return "Raccoons" end
+        if name:find("Trowel") then return "Trowels" end
+        -- Unknown gear – skip to avoid broken gifts
+        print("[Transfer] Unknown gear type: " .. name .. " – skipping (not giftable)")
+        return nil
+    end
+    return nil
+end
+
+function Transfer:scanInventory()
+    local items = {}
+    local function scanContainer(container)
+        if not container then return end
+        for _, tool in ipairs(container:GetChildren()) do
+            if tool:IsA("Tool") then
+                local mailCategory = getMailCategory(tool)
+                if mailCategory then
+                    local cntRaw = tool:GetAttribute("Count")
+                    local cntNum = tonumber(cntRaw)
+                    if cntNum and cntNum > 0 then
+                        table.insert(items, {
+                            Category = mailCategory,
+                            ItemKey = tool.Name,
+                            Count = cntNum
+                        })
+                    end
+                end
+            end
+        end
+    end
+    scanContainer(LocalPlayer:FindFirstChild("Backpack"))
+    scanContainer(LocalPlayer.Character)
+    return items
+end
+
+function Transfer:sendOnce()
+    if self.sendInProgress then return end
+    self.sendInProgress = true
+
+    local username = self.targetUsername
+    if username == "" then
+        self.sendInProgress = false
+        return
+    end
+
+    local allItems = self:scanInventory()
+    if #allItems == 0 then
+        self.sendInProgress = false
+        return
+    end
+
+    local ok, userId = pcall(function()
+        return Players:GetUserIdFromNameAsync(username)
+    end)
+    if not ok or not userId or userId == 0 then
+        self.sendInProgress = false
+        return
+    end
+
+    -- Chunk into 20
+    for i = 1, #allItems, 20 do
+        local chunk = {}
+        for j = i, math.min(i + 19, #allItems) do
+            table.insert(chunk, allItems[j])
+        end
+        print(string.format("[Transfer] Sending batch %d-%d to %s (%d items)", i, math.min(i+19, #allItems), username, #chunk))
+        local fireOk, err = pcall(function()
+            SendBatch:Fire(userId, chunk, "")
+        end)
+        if not fireOk then
+            print("[Transfer] Error: " .. tostring(err))
+            break
+        end
+        print("[Transfer] Batch sent.")
+        if i + 20 <= #allItems then
+            print("[Transfer] Cooldown 10s...")
+            task.wait(10)
+        end
+    end
+
+    self.sendInProgress = false
+end
+
+function Transfer:loop()
+    while self.enabled do
+        self:sendOnce()
+        task.wait(5)
+    end
+end
+
+function Transfer:start()
+    if self.enabled then return end
+    self.enabled = true
+    print("[Transfer] Auto‑send started (Seeds & Gears).")
+    task.spawn(function() self:loop() end)
+end
+
+function Transfer:stop()
+    self.enabled = false
+    print("[Transfer] Stopped.")
+end
+
+-- ================= GUI =================
+local function createGUI()
+    local sgui = Instance.new("ScreenGui")
+    sgui.Name = "BulkAutoBuyGUI"
+    sgui.Parent = LocalPlayer:WaitForChild("PlayerGui")
+
+    local frame = Instance.new("Frame")
+    frame.Size = UDim2.new(0, 700, 0, 460)
+    frame.Position = UDim2.new(0.5, -350, 0.5, -230)
+    frame.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
+    frame.BorderSizePixel = 0
+    frame.Active = true
+    frame.Draggable = true
+    frame.Parent = sgui
+
+    local title = Instance.new("TextLabel")
+    title.Text = "Bulk Auto Buy/Transfer"
+    title.Size = UDim2.new(1, 0, 0, 25)
+    title.BackgroundColor3 = Color3.fromRGB(60, 60, 60)
+    title.TextColor3 = Color3.new(1, 1, 1)
+    title.Font = Enum.Font.SourceSansBold
+    title.TextSize = 14
+    title.Parent = frame
+
+    -- Left: Seeds
+    local seedLabel = Instance.new("TextLabel")
+    seedLabel.Text = "Seeds"
+    seedLabel.Size = UDim2.new(0, 200, 0, 20)
+    seedLabel.Position = UDim2.new(0, 10, 0, 35)
+    seedLabel.BackgroundTransparency = 1
+    seedLabel.TextColor3 = Color3.new(1, 1, 1)
+    seedLabel.Font = Enum.Font.SourceSansBold
+    seedLabel.TextSize = 13
+    seedLabel.TextXAlignment = Enum.TextXAlignment.Left
+    seedLabel.Parent = frame
+
+    local seedDropdown = Instance.new("ScrollingFrame")
+    seedDropdown.Size = UDim2.new(0, 200, 0, 150)
+    seedDropdown.Position = UDim2.new(0, 10, 0, 60)
+    seedDropdown.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+    seedDropdown.BorderSizePixel = 0
+    seedDropdown.ScrollBarThickness = 8
+    seedDropdown.CanvasSize = UDim2.new(0, 0, 0, 0)
+    seedDropdown.Parent = frame
+
+    local seedListLayout = Instance.new("UIListLayout")
+    seedListLayout.Padding = UDim.new(0, 2)
+    seedListLayout.Parent = seedDropdown
+
+    local seedNames = getAllItemNames("Seeds")
+    for _, name in ipairs(seedNames) do
+        local row = Instance.new("Frame")
+        row.Size = UDim2.new(1, -10, 0, 22)
+        row.BackgroundTransparency = 1
+        row.Parent = seedDropdown
+
+        local cb = Instance.new("TextButton")
+        cb.Text = "  " .. name
+        cb.Size = UDim2.new(0, 180, 0, 20)
+        cb.Position = UDim2.new(0, 5, 0, 0)
+        cb.BackgroundColor3 = Color3.fromRGB(70, 70, 70)
+        cb.TextColor3 = Color3.new(1, 1, 1)
+        cb.Font = Enum.Font.SourceSans
+        cb.TextSize = 13
+        cb.TextXAlignment = Enum.TextXAlignment.Left
+        cb.Parent = row
+
+        local selected = (name == "Carrot")
+        if selected then
+            cb.BackgroundColor3 = Color3.fromRGB(50, 150, 50)
+            table.insert(AutoBuy.shops["Seeds"].selectedItems, name)
+        end
+
+        cb.MouseButton1Click:Connect(function()
+            selected = not selected
+            if selected then
+                cb.BackgroundColor3 = Color3.fromRGB(50, 150, 50)
+                if not table.find(AutoBuy.shops["Seeds"].selectedItems, name) then
+                    table.insert(AutoBuy.shops["Seeds"].selectedItems, name)
+                end
+            else
+                cb.BackgroundColor3 = Color3.fromRGB(70, 70, 70)
+                local idx = table.find(AutoBuy.shops["Seeds"].selectedItems, name)
+                if idx then table.remove(AutoBuy.shops["Seeds"].selectedItems, idx) end
+            end
+            print("[Seeds] Selected: " .. table.concat(AutoBuy.shops["Seeds"].selectedItems, ", "))
+        end)
+    end
+    seedDropdown.CanvasSize = UDim2.new(0, 0, 0, #seedNames * 24)
+
+    local seedToggle = Instance.new("TextButton")
+    seedToggle.Text = "OFF"
+    seedToggle.Size = UDim2.new(0, 60, 0, 22)
+    seedToggle.Position = UDim2.new(0, 10, 0, 220)
+    seedToggle.BackgroundColor3 = Color3.fromRGB(180, 50, 50)
+    seedToggle.TextColor3 = Color3.new(1, 1, 1)
+    seedToggle.Font = Enum.Font.SourceSansBold
+    seedToggle.TextSize = 14
+    seedToggle.Parent = frame
+
+    local seedTimer = Instance.new("TextLabel")
+    seedTimer.Text = "Seeds: --"
+    seedTimer.Size = UDim2.new(0, 140, 0, 22)
+    seedTimer.Position = UDim2.new(0, 75, 0, 220)
+    seedTimer.BackgroundTransparency = 1
+    seedTimer.TextColor3 = Color3.fromRGB(200, 200, 200)
+    seedTimer.TextSize = 12
+    seedTimer.Font = Enum.Font.SourceSans
+    seedTimer.TextXAlignment = Enum.TextXAlignment.Left
+    seedTimer.Parent = frame
+    AutoBuy.shops["Seeds"].timerLabel = seedTimer
+
+    local seedRunning = false
+    seedToggle.MouseButton1Click:Connect(function()
+        seedRunning = not seedRunning
+        if seedRunning then
+            seedToggle.Text = "ON"
+            seedToggle.BackgroundColor3 = Color3.fromRGB(50, 180, 50)
+            AutoBuy:startShop("Seeds")
+        else
+            seedToggle.Text = "OFF"
+            seedToggle.BackgroundColor3 = Color3.fromRGB(180, 50, 50)
+            AutoBuy:stopShop("Seeds")
+        end
+    end)
+
+    -- Right: Gears
+    local gearLabel = Instance.new("TextLabel")
+    gearLabel.Text = "Gears"
+    gearLabel.Size = UDim2.new(0, 200, 0, 20)
+    gearLabel.Position = UDim2.new(0, 250, 0, 35)
+    gearLabel.BackgroundTransparency = 1
+    gearLabel.TextColor3 = Color3.new(1, 1, 1)
+    gearLabel.Font = Enum.Font.SourceSansBold
+    gearLabel.TextSize = 13
+    gearLabel.TextXAlignment = Enum.TextXAlignment.Left
+    gearLabel.Parent = frame
+
+    local gearDropdown = Instance.new("ScrollingFrame")
+    gearDropdown.Size = UDim2.new(0, 200, 0, 150)
+    gearDropdown.Position = UDim2.new(0, 250, 0, 60)
+    gearDropdown.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+    gearDropdown.BorderSizePixel = 0
+    gearDropdown.ScrollBarThickness = 8
+    gearDropdown.CanvasSize = UDim2.new(0, 0, 0, 0)
+    gearDropdown.Parent = frame
+
+    local gearListLayout = Instance.new("UIListLayout")
+    gearListLayout.Padding = UDim.new(0, 2)
+    gearListLayout.Parent = gearDropdown
+
+    local gearNames = getAllItemNames("Gears")
+    for _, name in ipairs(gearNames) do
+        local row = Instance.new("Frame")
+        row.Size = UDim2.new(1, -10, 0, 22)
+        row.BackgroundTransparency = 1
+        row.Parent = gearDropdown
+
+        local cb = Instance.new("TextButton")
+        cb.Text = "  " .. name
+        cb.Size = UDim2.new(0, 180, 0, 20)
+        cb.Position = UDim2.new(0, 5, 0, 0)
+        cb.BackgroundColor3 = Color3.fromRGB(70, 70, 70)
+        cb.TextColor3 = Color3.new(1, 1, 1)
+        cb.Font = Enum.Font.SourceSans
+        cb.TextSize = 13
+        cb.TextXAlignment = Enum.TextXAlignment.Left
+        cb.Parent = row
+
+        local selected = false
+        cb.MouseButton1Click:Connect(function()
+            selected = not selected
+            if selected then
+                cb.BackgroundColor3 = Color3.fromRGB(50, 150, 50)
+                if not table.find(AutoBuy.shops["Gears"].selectedItems, name) then
+                    table.insert(AutoBuy.shops["Gears"].selectedItems, name)
+                end
+            else
+                cb.BackgroundColor3 = Color3.fromRGB(70, 70, 70)
+                local idx = table.find(AutoBuy.shops["Gears"].selectedItems, name)
+                if idx then table.remove(AutoBuy.shops["Gears"].selectedItems, idx) end
+            end
+            print("[Gears] Selected: " .. table.concat(AutoBuy.shops["Gears"].selectedItems, ", "))
+        end)
+    end
+    gearDropdown.CanvasSize = UDim2.new(0, 0, 0, #gearNames * 24)
+
+    local gearToggle = Instance.new("TextButton")
+    gearToggle.Text = "OFF"
+    gearToggle.Size = UDim2.new(0, 60, 0, 22)
+    gearToggle.Position = UDim2.new(0, 250, 0, 220)
+    gearToggle.BackgroundColor3 = Color3.fromRGB(180, 50, 50)
+    gearToggle.TextColor3 = Color3.new(1, 1, 1)
+    gearToggle.Font = Enum.Font.SourceSansBold
+    gearToggle.TextSize = 14
+    gearToggle.Parent = frame
+
+    local gearTimer = Instance.new("TextLabel")
+    gearTimer.Text = "Gears: --"
+    gearTimer.Size = UDim2.new(0, 140, 0, 22)
+    gearTimer.Position = UDim2.new(0, 315, 0, 220)
+    gearTimer.BackgroundTransparency = 1
+    gearTimer.TextColor3 = Color3.fromRGB(200, 200, 200)
+    gearTimer.TextSize = 12
+    gearTimer.Font = Enum.Font.SourceSans
+    gearTimer.TextXAlignment = Enum.TextXAlignment.Left
+    gearTimer.Parent = frame
+    AutoBuy.shops["Gears"].timerLabel = gearTimer
+
+    local gearRunning = false
+    gearToggle.MouseButton1Click:Connect(function()
+        gearRunning = not gearRunning
+        if gearRunning then
+            gearToggle.Text = "ON"
+            gearToggle.BackgroundColor3 = Color3.fromRGB(50, 180, 50)
+            AutoBuy:startShop("Gears")
+        else
+            gearToggle.Text = "OFF"
+            gearToggle.BackgroundColor3 = Color3.fromRGB(180, 50, 50)
+            AutoBuy:stopShop("Gears")
+        end
+    end)
+
+    -- Transfer section
+    local transLabel = Instance.new("TextLabel")
+    transLabel.Text = "Auto‑Transfer (Seeds & Gears)"
+    transLabel.Size = UDim2.new(1, -20, 0, 20)
+    transLabel.Position = UDim2.new(0, 10, 0, 255)
+    transLabel.BackgroundTransparency = 1
+    transLabel.TextColor3 = Color3.new(1, 1, 1)
+    transLabel.TextSize = 13
+    transLabel.Font = Enum.Font.SourceSansBold
+    transLabel.TextXAlignment = Enum.TextXAlignment.Left
+    transLabel.Parent = frame
+
+    local targetBox = Instance.new("TextBox")
+    targetBox.PlaceholderText = "Target username"
+    targetBox.Text = ""
+    targetBox.Size = UDim2.new(0, 160, 0, 22)
+    targetBox.Position = UDim2.new(0, 10, 0, 280)
+    targetBox.BackgroundColor3 = Color3.fromRGB(60, 60, 60)
+    targetBox.TextColor3 = Color3.new(1, 1, 1)
+    targetBox.Font = Enum.Font.SourceSans
+    targetBox.TextSize = 13
+    targetBox.Parent = frame
+    targetBox:GetPropertyChangedSignal("Text"):Connect(function()
+        Transfer.targetUsername = targetBox.Text
+    end)
+
+    local transToggle = Instance.new("TextButton")
+    transToggle.Text = "OFF"
+    transToggle.Size = UDim2.new(0, 60, 0, 22)
+    transToggle.Position = UDim2.new(0, 175, 0, 280)
+    transToggle.BackgroundColor3 = Color3.fromRGB(180, 50, 50)
+    transToggle.TextColor3 = Color3.new(1, 1, 1)
+    transToggle.Font = Enum.Font.SourceSansBold
+    transToggle.TextSize = 14
+    transToggle.Parent = frame
+
+    local transRunning = false
+    transToggle.MouseButton1Click:Connect(function()
+        transRunning = not transRunning
+        if transRunning then
+            transToggle.Text = "ON"
+            transToggle.BackgroundColor3 = Color3.fromRGB(50, 180, 50)
+            Transfer:start()
+        else
+            transToggle.Text = "OFF"
+            transToggle.BackgroundColor3 = Color3.fromRGB(180, 50, 50)
+            Transfer:stop()
+        end
+    end)
+
+    -- Close
+    local closeBtn = Instance.new("TextButton")
+    closeBtn.Text = "X"
+    closeBtn.Size = UDim2.new(0, 22, 0, 22)
+    closeBtn.Position = UDim2.new(1, -24, 0, 1)
+    closeBtn.BackgroundColor3 = Color3.fromRGB(200, 60, 60)
+    closeBtn.TextColor3 = Color3.new(1, 1, 1)
+    closeBtn.Font = Enum.Font.SourceSansBold
+    closeBtn.TextSize = 14
+    closeBtn.Parent = frame
+    closeBtn.MouseButton1Click:Connect(function()
+        AutoBuy:stopShop("Seeds")
+        AutoBuy:stopShop("Gears")
+        Transfer:stop()
+        sgui:Destroy()
+    end)
+end
+
+createGUI()
+print("[Main] Bulk Auto Buy/Transfer loaded. Transfer now sends Seeds & Gears correctly.")
