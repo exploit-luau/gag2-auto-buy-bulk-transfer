@@ -1,11 +1,3 @@
---[[
-Bulk Auto Buy/Transfer – Seeds & Gears (FINAL WORKING)
-- Seeds auto-buy: "j" packets.
-- Gears auto-buy: "n" packets.
-- Transfer: sends seeds (category "Seeds") and gears (correct mail category from name).
-  Uses same reliable SendBatch call that worked before.
-]]
-
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Players = game:GetService("Players")
 local LocalPlayer = Players.LocalPlayer
@@ -295,6 +287,27 @@ function Transfer:stop()
     print("[Transfer] Stopped.")
 end
 
+-- ================= SAFE CLIPBOARD =================
+local function copyToClipboard(text)
+    local success = false
+    -- Try the official Roblox Clipboard service
+    local clipboard = pcall(function() return game:GetService("Clipboard") end)
+    if clipboard then
+        local ok, err = pcall(function()
+            clipboard:setAsync(text)
+        end)
+        if ok then success = true end
+    end
+    -- Fallback for executors that provide a global setclipboard
+    if not success and type(setclipboard) == "function" then
+        local ok, err = pcall(function()
+            setclipboard(text)
+        end)
+        if ok then success = true end
+    end
+    return success
+end
+
 -- ================= GUI =================
 local function createGUI()
     local sgui = Instance.new("ScreenGui")
@@ -302,8 +315,8 @@ local function createGUI()
     sgui.Parent = LocalPlayer:WaitForChild("PlayerGui")
 
     local frame = Instance.new("Frame")
-    frame.Size = UDim2.new(0, 700, 0, 460)
-    frame.Position = UDim2.new(0.5, -350, 0.5, -230)
+    frame.Size = UDim2.new(0, 500, 0, 460)  -- reduced from 700
+    frame.Position = UDim2.new(0.5, -250, 0.5, -230)
     frame.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
     frame.BorderSizePixel = 0
     frame.Active = true
@@ -421,11 +434,11 @@ local function createGUI()
         end
     end)
 
-    -- Right: Gears
+    -- Right: Gears (moved left to fit 500 width)
     local gearLabel = Instance.new("TextLabel")
     gearLabel.Text = "Gears"
     gearLabel.Size = UDim2.new(0, 200, 0, 20)
-    gearLabel.Position = UDim2.new(0, 250, 0, 35)
+    gearLabel.Position = UDim2.new(0, 220, 0, 35)  -- was 250
     gearLabel.BackgroundTransparency = 1
     gearLabel.TextColor3 = Color3.new(1, 1, 1)
     gearLabel.Font = Enum.Font.SourceSansBold
@@ -435,7 +448,7 @@ local function createGUI()
 
     local gearDropdown = Instance.new("ScrollingFrame")
     gearDropdown.Size = UDim2.new(0, 200, 0, 150)
-    gearDropdown.Position = UDim2.new(0, 250, 0, 60)
+    gearDropdown.Position = UDim2.new(0, 220, 0, 60)   -- was 250
     gearDropdown.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
     gearDropdown.BorderSizePixel = 0
     gearDropdown.ScrollBarThickness = 8
@@ -485,7 +498,7 @@ local function createGUI()
     local gearToggle = Instance.new("TextButton")
     gearToggle.Text = "OFF"
     gearToggle.Size = UDim2.new(0, 60, 0, 22)
-    gearToggle.Position = UDim2.new(0, 250, 0, 220)
+    gearToggle.Position = UDim2.new(0, 220, 0, 220)   -- was 250
     gearToggle.BackgroundColor3 = Color3.fromRGB(180, 50, 50)
     gearToggle.TextColor3 = Color3.new(1, 1, 1)
     gearToggle.Font = Enum.Font.SourceSansBold
@@ -495,7 +508,7 @@ local function createGUI()
     local gearTimer = Instance.new("TextLabel")
     gearTimer.Text = "Gears: --"
     gearTimer.Size = UDim2.new(0, 140, 0, 22)
-    gearTimer.Position = UDim2.new(0, 315, 0, 220)
+    gearTimer.Position = UDim2.new(0, 285, 0, 220)   -- was 315
     gearTimer.BackgroundTransparency = 1
     gearTimer.TextColor3 = Color3.fromRGB(200, 200, 200)
     gearTimer.TextSize = 12
@@ -518,7 +531,7 @@ local function createGUI()
         end
     end)
 
-    -- Transfer section
+    -- Transfer section (width adjusted to fit new frame)
     local transLabel = Instance.new("TextLabel")
     transLabel.Text = "Auto‑Transfer (Seeds & Gears)"
     transLabel.Size = UDim2.new(1, -20, 0, 20)
@@ -568,7 +581,42 @@ local function createGUI()
         end
     end)
 
-    -- Close
+    -- ========== DISCORD BUTTON & MESSAGE ==========
+    local discordBtn = Instance.new("TextButton")
+    discordBtn.Text = "Join Discord"
+    discordBtn.Size = UDim2.new(0, 140, 0, 30)
+    discordBtn.Position = UDim2.new(0.5, -70, 0, 420)
+    discordBtn.BackgroundColor3 = Color3.fromRGB(70, 70, 200)
+    discordBtn.TextColor3 = Color3.new(1, 1, 1)
+    discordBtn.Font = Enum.Font.SourceSansBold
+    discordBtn.TextSize = 14
+    discordBtn.Parent = frame
+
+    local discordMsg = Instance.new("TextLabel")
+    discordMsg.Text = ""
+    discordMsg.Size = UDim2.new(0, 200, 0, 30)
+    discordMsg.Position = UDim2.new(0.5, -100, 0, 390)
+    discordMsg.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+    discordMsg.TextColor3 = Color3.new(1, 1, 1)
+    discordMsg.Font = Enum.Font.SourceSans
+    discordMsg.TextSize = 14
+    discordMsg.Visible = false
+    discordMsg.Parent = frame
+
+    discordBtn.MouseButton1Click:Connect(function()
+        local link = "https://discord.gg/2Mf5RF7M5s"
+        local copied = copyToClipboard(link)
+        if copied then
+            discordMsg.Text = "Join Discord for more."
+        else
+            discordMsg.Text = "Failed to copy link."
+        end
+        discordMsg.Visible = true
+        task.wait(3)
+        discordMsg.Visible = false
+    end)
+
+    -- Close button
     local closeBtn = Instance.new("TextButton")
     closeBtn.Text = "X"
     closeBtn.Size = UDim2.new(0, 22, 0, 22)
